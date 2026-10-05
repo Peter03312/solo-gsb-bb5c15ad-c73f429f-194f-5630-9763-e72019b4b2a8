@@ -1,4 +1,4 @@
-"""持久层：草稿（带乐观锁修订号、按键合并与修订快照）、不可变发布版本、默认投递策略（基线/候选灰度）、幂等投递判定、历史判定核对报表与灰度自动熔断。"""
+"""持久层：草稿（带乐观锁修订号、按键合并与修订快照）、不可变发布版本、默认投递策略（基线/候选灰度）、幂等投递判定、实际投递回执、历史判定核对报表与灰度自动熔断。"""
 from __future__ import annotations
 
 import json
@@ -55,6 +55,47 @@ class PolicyNotConfigured(Exception):
 
     def __init__(self):
         super().__init__("no delivery policy configured")
+
+
+class ReceiptConflict(Exception):
+    """同一终点同一尝试序号已记录不同结果：回执不可改写。"""
+
+    def __init__(self, delivery_id: str, mailbox: str, attempt: int, stored_result: str):
+        super().__init__(
+            f"receipt conflict: {delivery_id!r} {mailbox} attempt {attempt} "
+            f"already recorded as {stored_result!r}"
+        )
+        self.delivery_id = delivery_id
+        self.mailbox = mailbox
+        self.attempt = attempt
+        self.stored_result = stored_result
+
+
+class AttemptNotIncreasing(Exception):
+    """新尝试序号未大于该终点已记录的最大序号。"""
+
+    def __init__(self, delivery_id: str, mailbox: str, attempt: int, max_attempt: int):
+        super().__init__(
+            f"attempt {attempt} is not greater than the last recorded attempt {max_attempt} "
+            f"for {delivery_id!r} {mailbox}"
+        )
+        self.delivery_id = delivery_id
+        self.mailbox = mailbox
+        self.attempt = attempt
+        self.max_attempt = max_attempt
+
+
+class EndpointFinalized(Exception):
+    """终点已送达或已永久失败（终态），不再接收新尝试。"""
+
+    def __init__(self, delivery_id: str, mailbox: str, final_result: str):
+        super().__init__(
+            f"endpoint {mailbox} for {delivery_id!r} is finalized as {final_result!r}; "
+            "no further attempts accepted"
+        )
+        self.delivery_id = delivery_id
+        self.mailbox = mailbox
+        self.final_result = final_result
 
 
 def _row_to_rule(row: sqlite3.Row) -> Rule:
@@ -558,6 +599,115 @@ def save_decision(
         ),
     )
     return get_decision(conn, delivery_id)
+
+
+# ---------- 实际投递回执（成功判定的终点 × 正整数尝试序号 → 投递结果，只增不改） ----------
+#
+# 回执挂在已持久化的成功判定上：只允许判定 endpoints 中列出的终点邮箱。
+# 同一终点内尝试序号严格递增；同序号同结果的重试原样返回已存记录（幂等），
+# 同序号不同结果抛 ReceiptConflict；终点已送达（delivered）或永久失败
+# （permanent_failure）进入终态，不再接收新尝试（EndpointFinalized）。
+# 全部核对与写入在单个 BEGIN IMMEDIATE 事务内完成，并发回传串行化，
+# 序号与汇总状态因此始终一致。回执独立成表：判定查询 / 重放、核对报表与
+# 灰度熔断统计都只读 delivery_decisions，不受回执影响。
+
+_RECEIPT_COLUMNS = "delivery_id, mailbox, attempt, result, created_at"
+
+# 终点终态结果：到达后不再接收新尝试
+_FINAL_RESULTS = ("delivered", "permanent_failure")
+
+
+def get_receipts(conn: sqlite3.Connection, delivery_id: str) -> list[dict]:
+    """读取某投递编号的全部回执（按终点邮箱、尝试序号升序）；无回执返回空列表。"""
+    rows = conn.execute(
+        f"SELECT {_RECEIPT_COLUMNS} FROM delivery_receipts WHERE delivery_id = ? "
+        "ORDER BY mailbox, attempt",
+        (delivery_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def save_receipt(
+    conn: sqlite3.Connection,
+    *,
+    delivery_id: str,
+    mailbox: str,
+    attempt: int,
+    result: str,
+) -> dict:
+    """记录一次实际投递结果。须在写事务内调用，调用方须先完成全部核对。
+
+    - 同终点同序号：结果相同 → 原样返回已存记录（幂等重试）；不同 → ReceiptConflict；
+    - 新序号必须大于该终点已记录的最大序号，否则 AttemptNotIncreasing；
+    - 终点已送达 / 已永久失败（终态）后不再接收新尝试，否则 EndpointFinalized。
+    任何拒绝都在写入前抛出，由调用方回滚，不产生记录。
+    """
+    rows = conn.execute(
+        f"SELECT {_RECEIPT_COLUMNS} FROM delivery_receipts WHERE delivery_id = ? AND mailbox = ? "
+        "ORDER BY attempt",
+        (delivery_id, mailbox),
+    ).fetchall()
+    receipts = [dict(r) for r in rows]
+    for receipt in receipts:  # 同序号：幂等重放或冲突，先于终态与新序号核对
+        if receipt["attempt"] == attempt:
+            if receipt["result"] == result:
+                return receipt
+            raise ReceiptConflict(delivery_id, mailbox, attempt, receipt["result"])
+    if receipts:
+        max_attempt = receipts[-1]["attempt"]
+        if attempt <= max_attempt:
+            raise AttemptNotIncreasing(delivery_id, mailbox, attempt, max_attempt)
+        last_result = receipts[-1]["result"]
+        if last_result in _FINAL_RESULTS:
+            raise EndpointFinalized(delivery_id, mailbox, last_result)
+    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn.execute(
+        "INSERT INTO delivery_receipts (delivery_id, mailbox, attempt, result, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (delivery_id, mailbox, attempt, result, created_at),
+    )
+    return {
+        "delivery_id": delivery_id,
+        "mailbox": mailbox,
+        "attempt": attempt,
+        "result": result,
+        "created_at": created_at,
+    }
+
+
+def summarize_receipts(endpoints: list[dict], receipts: list[dict]) -> dict:
+    """由判定终点与全部回执推导各终点状态与整单汇总状态（纯函数，不落库）。
+
+    终点状态取该终点最新（序号最大）回执的结果；无回执为 pending。
+    汇总：全部终点已送达 → delivered；任一终点永久失败 → failed；其余 → pending
+    （无回执也为 pending）。终态（delivered / permanent_failure）后不再有新回执，
+    因此最新回执即终点最终状态。
+    """
+    by_mailbox: dict[str, list[dict]] = {}
+    for receipt in receipts:
+        by_mailbox.setdefault(receipt["mailbox"], []).append(receipt)
+    endpoint_docs: list[dict] = []
+    statuses: list[str] = []
+    for endpoint in endpoints:
+        mailbox = endpoint["mailbox"]
+        attempts = sorted(by_mailbox.get(mailbox, []), key=lambda r: r["attempt"])
+        status = attempts[-1]["result"] if attempts else "pending"
+        statuses.append(status)
+        endpoint_docs.append({
+            "mailbox": mailbox,
+            "status": status,
+            "attempts": [
+                {"attempt": r["attempt"], "result": r["result"], "created_at": r["created_at"]}
+                for r in attempts
+            ],
+        })
+    if statuses and all(s == "delivered" for s in statuses):
+        summary = "delivered"
+    elif any(s == "permanent_failure" for s in statuses):
+        summary = "failed"
+    else:
+        summary = "pending"
+    return {"summary": summary, "endpoints": endpoint_docs}
 
 
 # ---------- 历史投递判定核对报表（时间窗 + 快照边界 + 分组计数 + 键集分页） ----------

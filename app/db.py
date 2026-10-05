@@ -1,4 +1,4 @@
-"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略、幂等投递判定与灰度熔断。"""
+"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略、幂等投递判定、实际投递回执与灰度熔断。"""
 from __future__ import annotations
 
 import os
@@ -75,6 +75,19 @@ CREATE TABLE IF NOT EXISTS delivery_decisions (
     endpoints         TEXT,                             -- JSON: [{"mailbox", "paths"}]；status='ok' 时非空
     error             TEXT,                             -- JSON: 失败详情（rejected/no_route/cycle）；status='failed' 时非空
     created_at        TEXT NOT NULL
+);
+
+-- 实际投递回执：每个（投递编号, 终点邮箱, 尝试序号）一行，只增不改。
+-- 仅允许成功判定（delivery_decisions.status = 'ok'）中列出的终点；
+-- 同一终点的尝试序号严格递增；终点已送达或永久失败后不再接收新尝试。
+-- 回执与判定分表存放：判定查询 / 重放内容与灰度熔断统计均不受回执影响。
+CREATE TABLE IF NOT EXISTS delivery_receipts (
+    delivery_id TEXT NOT NULL REFERENCES delivery_decisions (delivery_id) ON DELETE CASCADE,
+    mailbox     TEXT NOT NULL,                    -- 判定中列出的终点邮箱（规范化）
+    attempt     INTEGER NOT NULL CHECK (attempt >= 1),  -- 正整数尝试序号（同一终点内严格递增）
+    result      TEXT NOT NULL CHECK (result IN ('temporary_failure', 'permanent_failure', 'delivered')),
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (delivery_id, mailbox, attempt)
 );
 
 -- 灰度熔断设置：单行（id 恒为 1），绑定设置时所见的策略修订号。

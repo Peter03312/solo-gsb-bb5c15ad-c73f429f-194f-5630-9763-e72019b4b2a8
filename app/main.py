@@ -1,4 +1,4 @@
-"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定（单笔与批量）、历史判定核对报表与灰度自动熔断。"""
+"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定（单笔与批量）、实际投递回执、历史判定核对报表与灰度自动熔断。"""
 from __future__ import annotations
 
 import sqlite3
@@ -17,6 +17,7 @@ from .models import (
     PolicyUpdate,
     PreviewRequest,
     PublishRequest,
+    ReceiptSubmit,
     ResolveRequest,
     ValidationFailure,
     normalize_changes,
@@ -734,3 +735,94 @@ def get_delivery(delivery_id: str) -> dict:
         "error": decision["error"],
         "created_at": decision["created_at"],
     }
+
+
+# ---------- 实际投递回执（成功判定的终点 × 尝试序号 → 结果；汇总状态由回执推导） ----------
+
+def _receipt_decision(conn, delivery_id: str) -> dict:
+    """取出可接收回执的判定：未知编号 404、原判定失败 409，两者都不产生任何回执记录。"""
+    decision = store.get_decision(conn, delivery_id)
+    if decision is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "delivery_not_found", "delivery_id": delivery_id},
+        )
+    if decision["status"] != "ok":
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "decision_failed", "delivery_id": delivery_id,
+                    "message": f"delivery {delivery_id!r} has a failed decision; only successful "
+                               "decisions accept delivery receipts"},
+        )
+    return decision
+
+
+@app.post("/deliveries/{delivery_id}/receipts")
+def submit_receipt(delivery_id: str, body: ReceiptSubmit) -> dict:
+    """回传一次实际投递结果（暂时失败 / 永久失败 / 已送达）。
+
+    只允许已持久化成功判定中列出的终点：未知编号（404）、原判定失败（409
+    decision_failed）、非所属终点（422 endpoint_not_in_decision）一律拒绝且不产生记录。
+    同一终点的同序号同结果重试原样返回已存记录；同序号结果不同返回 409
+    （receipt_conflict）；新序号必须大于该终点已记录序号（否则 409
+    attempt_not_increasing）；终点已送达或永久失败后不再接收新尝试（409
+    endpoint_finalized）。核对与写入在单个 BEGIN IMMEDIATE 事务内原子完成，
+    并发回传串行化，序号与汇总状态保持一致。回执不改写判定：既有判定查询、
+    同编号重放内容与灰度熔断统计均不受影响。
+    """
+    mailbox = body.mailbox.strip().lower()
+    if not is_valid_address(mailbox):
+        raise HTTPException(status_code=422, detail={"error": "invalid_address", "message": f"invalid mailbox: {body.mailbox!r}"})
+    try:
+        with db.transaction() as conn:
+            decision = _receipt_decision(conn, delivery_id)
+            allowed = [e["mailbox"] for e in decision["endpoints"]]
+            if mailbox not in allowed:  # 非所属终点：拒绝且不产生记录
+                raise HTTPException(
+                    status_code=422,
+                    detail={"error": "endpoint_not_in_decision", "delivery_id": delivery_id,
+                            "mailbox": mailbox, "endpoints": allowed,
+                            "message": f"{mailbox} is not an endpoint of delivery {delivery_id!r}"},
+                )
+            receipt = store.save_receipt(
+                conn, delivery_id=delivery_id, mailbox=mailbox,
+                attempt=body.attempt, result=body.result,
+            )
+    except store.ReceiptConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "receipt_conflict", "delivery_id": exc.delivery_id,
+                    "mailbox": exc.mailbox, "attempt": exc.attempt,
+                    "stored_result": exc.stored_result, "message": str(exc)},
+        )
+    except store.AttemptNotIncreasing as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "attempt_not_increasing", "delivery_id": exc.delivery_id,
+                    "mailbox": exc.mailbox, "attempt": exc.attempt,
+                    "max_attempt": exc.max_attempt, "message": str(exc)},
+        )
+    except store.EndpointFinalized as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "endpoint_finalized", "delivery_id": exc.delivery_id,
+                    "mailbox": exc.mailbox, "final_result": exc.final_result, "message": str(exc)},
+        )
+    except sqlite3.OperationalError as exc:  # 并发写冲突
+        raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
+    return receipt
+
+
+@app.get("/deliveries/{delivery_id}/receipts")
+def get_receipts(delivery_id: str) -> dict:
+    """查询某投递编号各终点的尝试记录与汇总状态。
+
+    每个终点列出全部尝试（按序号升序）与当前状态（最新回执的结果，无回执为
+    pending）；汇总状态：全部终点已送达 → delivered，任一终点永久失败 → failed，
+    其余（含无任何回执）→ pending。未知编号 404、原判定失败 409（同回传约定）。
+    """
+    with db.read_transaction() as conn:
+        decision = _receipt_decision(conn, delivery_id)
+        receipts = store.get_receipts(conn, delivery_id)
+        view = store.summarize_receipts(decision["endpoints"], receipts)
+    return {"delivery_id": delivery_id, **view}
