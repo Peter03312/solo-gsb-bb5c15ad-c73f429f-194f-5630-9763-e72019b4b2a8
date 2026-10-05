@@ -1,4 +1,4 @@
-"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略、幂等投递判定与灰度熔断。"""
+"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略、幂等投递判定、投递回执与灰度熔断。"""
 from __future__ import annotations
 
 import os
@@ -100,6 +100,21 @@ CREATE TABLE IF NOT EXISTS circuit_breaks (
     sample_count              INTEGER NOT NULL,              -- 窗口内同修订号的候选判定数
     failure_count             INTEGER NOT NULL,              -- 其中失败数
     triggered_at              TEXT NOT NULL
+);
+
+-- 投递回执：投递系统取得已持久化的成功判定后，按投递编号 + 终点邮箱 + 尝试序号
+-- 回传实际投递结果（暂时失败 / 永久失败 / 已送达）。
+-- 只允许成功判定中列出的终点；未知编号、原判定失败、非所属终点一律拒绝且不写记录。
+-- 同一 (投递编号, 终点, 序号) 只允许一种结果：同结果重试原样返回，不同结果报冲突；
+-- 新序号必须大于该终点已记录的最大序号；已送达 / 永久失败为终结结果，之后不得再收新尝试。
+-- 回执与判定、策略、熔断统计完全解耦：写入回执不影响判定重放、核对报表与灰度熔断。
+CREATE TABLE IF NOT EXISTS delivery_attempts (
+    delivery_id TEXT NOT NULL REFERENCES delivery_decisions (delivery_id),
+    mailbox     TEXT NOT NULL,                    -- 判定终点邮箱（规范化小写）
+    attempt_no  INTEGER NOT NULL CHECK (attempt_no >= 1),   -- 正整数尝试序号
+    result      TEXT NOT NULL CHECK (result IN ('temporary_failure', 'permanent_failure', 'delivered')),
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (delivery_id, mailbox, attempt_no)
 );
 """
 

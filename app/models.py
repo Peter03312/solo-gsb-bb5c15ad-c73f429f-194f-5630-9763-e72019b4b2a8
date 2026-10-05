@@ -98,6 +98,14 @@ class DeliveryBatchSubmit(BaseModel):
     )
 
 
+class DeliveryReceiptIn(BaseModel):
+    """投递系统对某投递编号的某个终点邮箱回传的一次实际投递结果。"""
+
+    mailbox: str
+    attempt_no: int = Field(ge=1, description="正整数尝试序号")
+    result: Literal["temporary_failure", "permanent_failure", "delivered"]
+
+
 class ValidationFailure(Exception):
     """编辑期校验失败，message 直接作为 4xx 响应。"""
 

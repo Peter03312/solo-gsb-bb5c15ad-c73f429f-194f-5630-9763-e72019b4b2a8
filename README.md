@@ -64,6 +64,18 @@
   失败数与触发时间**。触发请求仍返回原判定，后续默认投递按基线执行；同编号重放不重复计数，
   历史判定及响应不改写。人工更新策略（或熔断本身）使修订号 `+1` 后旧设置即失效，须针对新修订
   重新设置；未配置策略、非法参数、修订号冲突均明确报错且不产生熔断。
+- **投递结果回执**：投递系统取得**已持久化的成功判定**后，用
+  `POST /deliveries/{id}/receipts` 按**投递编号 + 终点邮箱 + 正整数尝试序号**回传实际投递结果
+  （`temporary_failure` 暂时失败 / `permanent_failure` 永久失败 / `delivered` 已送达），
+  `GET /deliveries/{id}/receipts` 查询该编号**各终点的尝试记录与汇总状态**。
+  **只允许成功判定中列出的终点**：未知编号（404）、原判定失败（409）、邮箱不属于该判定的终点
+  （409）一律拒绝且**不产生记录**。同一终点的**同序号同结果**重试**原样返回**首次记录，
+  **同序号不同结果**报 `409`；新序号必须**严格大于**该终点已记录的最大序号（允许跳号），
+  **已送达 / 永久失败为终结结果**，之后不再接收任何新尝试（同序号同结果重放仍原样返回）。
+  汇总：**全部终点已送达 → `delivered`；任一终点永久失败 → `failed`；其余（含无任何回执）→
+  `pending`**。核对与写入在单个 `BEGIN IMMEDIATE` 事务内完成，并发回传串行化，序号与汇总一致。
+  回执只增不改、与判定/策略/熔断完全解耦：既有判定查询、同编号重放内容、核对报表与灰度熔断
+  统计均不受回执影响。
 
 ## 一键启动（Docker Compose）
 
@@ -122,6 +134,8 @@ pytest tests/ -q                                   # 运行测试
 | POST | `/deliveries`     | 幂等投递：投递编号 + 地址，首次判定持久化、重试原样返回 |
 | POST | `/deliveries/batch` | 批量幂等投递：一次至多 100 笔，逐项判定按输入顺序返回，整批先校验 |
 | GET  | `/deliveries/report` | 历史判定核对报表：时间窗 + 分组计数 + 游标分页     |
+| POST | `/deliveries/{id}/receipts` | 投递结果回执：按终点 + 正整数序号回传实际投递结果 |
+| GET  | `/deliveries/{id}/receipts` | 查询各终点尝试记录（按序号升序）与汇总状态         |
 | GET  | `/deliveries/{id}` | 按投递编号查询已持久化的判定（含失败） |
 
 ## 调用示例
@@ -728,6 +742,108 @@ curl 'http://localhost:8000/deliveries/report?cursor=eyJ2IjoxLCJzdGFydCI6...'
 > 该报表只读取已持久化的判定，不改动任何数据；`POST /deliveries` 的幂等判定、
 > `GET /deliveries/{id}` 的按编号查询与原样重放语义完全不变。
 
+## 投递结果回执：按终点 + 尝试序号回传实际投递结果
+
+投递系统从 `POST /deliveries` 取得**已持久化的成功判定**（含去重后的全部终点邮箱）并实际发信后，
+用回执接口回报每个终点每次尝试的真实结果。回执依附判定存在，但只增不改、与判定和熔断完全解耦。
+
+### 16. 回传一次实际投递结果（POST /deliveries/{id}/receipts）
+
+路径参数为投递编号；请求体给出**判定中的一个终点邮箱、正整数尝试序号与本次结果**
+（邮箱与地址一样先去空白、转小写再比对）：
+
+```bash
+curl -X POST http://localhost:8000/deliveries/msg-2026-10-05-0001/receipts \
+  -H 'Content-Type: application/json' \
+  -d '{"mailbox": "alice@mail.example.com", "attempt_no": 1, "result": "temporary_failure"}'
+```
+
+```json
+{
+  "delivery_id": "msg-2026-10-05-0001",
+  "mailbox": "alice@mail.example.com",
+  "attempt_no": 1,
+  "result": "temporary_failure",
+  "created_at": "2026-10-05T03:12:00+00:00"
+}
+```
+
+`result` 三选一：`temporary_failure`（暂时失败，可继续重试）、`permanent_failure`（永久失败）、
+`delivered`（已送达）。
+
+**受理前提（任一不满足即拒绝，且不产生任何记录）**：
+
+| 场景 | 状态码 / error |
+| ---- | -------------- |
+| 未知投递编号（POST 与 GET 均如此） | `404 {"error": "delivery_not_found", ...}` |
+| 原判定为路由失败（rejected / no_route / cycle），没有终点 | `409 {"error": "delivery_decision_failed", "decision_status": "failed", "error_type": "...", ...}` |
+| 邮箱不在该成功判定列出的终点中（含属于别的投递编号的终点） | `409 {"error": "endpoint_not_allowed", "mailbox": ..., "allowed_endpoints": [...]}` |
+| 邮箱格式非法 | `422 {"error": "invalid_address", ...}`；`attempt_no < 1`、非法 `result` 也为 `422`（请求体校验） |
+
+**序号与结果规则（按每个“投递编号 × 终点”独立计算）**：
+
+- **同序号同结果重试原样返回**：超时 / 并发重发完全相同的（序号, 结果）时，返回与首次逐字段相同
+  的记录（含首次 `created_at`），不新增记录。
+- **同序号不同结果报冲突**：`409 {"error": "attempt_result_conflict", "stored_result": ...,
+  "submitted_result": ..., ...}`，首次记录不改写。
+- **新序号严格递增**：必须大于该终点已记录的最大序号（允许跳号，如 1 之后直接 3）；
+  否则 `409 {"error": "attempt_sequence_conflict", "last_attempt_no": ..., ...}`。
+- **终结结果后封口**：某终点已记录 `delivered` 或 `permanent_failure` 后，任何**新序号**都被
+  拒绝：`409 {"error": "endpoint_terminal", "terminal_result": ..., "terminal_attempt_no": ...,
+  ...}`；该终结序号自身的同结果重放仍原样返回。
+
+```bash
+# 第 1 次暂时失败 → 第 2 次送达
+curl -X POST .../receipts -d '{"mailbox":"alice@mail.example.com","attempt_no":2,"result":"delivered"}'
+# 超时重发：同序号同结果，原样返回 200
+curl -X POST .../receipts -d '{"mailbox":"alice@mail.example.com","attempt_no":2,"result":"delivered"}'
+# 已送达后再报新尝试 → 409 endpoint_terminal
+curl -X POST .../receipts -d '{"mailbox":"alice@mail.example.com","attempt_no":3,"result":"temporary_failure"}'
+```
+
+### 17. 查询各终点尝试记录与汇总状态（GET /deliveries/{id}/receipts）
+
+```bash
+curl http://localhost:8000/deliveries/msg-2026-10-05-0001/receipts
+```
+
+```json
+{
+  "delivery_id": "msg-2026-10-05-0001",
+  "status": "delivered",
+  "endpoints": [
+    {"mailbox": "alice@mail.example.com", "status": "delivered", "attempts": [
+      {"attempt_no": 1, "result": "temporary_failure", "created_at": "2026-10-05T03:12:00+00:00"},
+      {"attempt_no": 2, "result": "delivered",         "created_at": "2026-10-05T03:15:00+00:00"}
+    ]},
+    {"mailbox": "bob@mail.example.com", "status": "delivered", "attempts": [
+      {"attempt_no": 1, "result": "delivered", "created_at": "2026-10-05T03:12:01+00:00"}
+    ]}
+  ]
+}
+```
+
+- `endpoints` 按判定中的终点逐一列出（顺序与持久化判定一致），`attempts` 按尝试序号升序；
+  终点状态 `status`：无记录为 `"pending"`，否则取**最大序号**记录的结果
+  （`temporary_failure` / `permanent_failure` / `delivered`，终结结果必为最后一条）。
+- 顶层汇总 `status`：
+  - **全部终点 `delivered` → `"delivered"`**；
+  - **任一终点 `permanent_failure` → `"failed"`**（即使其他终点仍 pending）；
+  - **其余 → `"pending"`**——**尚无任何回执时同样为 `pending"`**，各终点 `attempts` 为空。
+- 未知编号 → `404 delivery_not_found`；原判定失败 → `409 delivery_decision_failed`。
+
+### 18. 并发与既有功能的边界
+
+- 回传的“全部核对 + 写入”在单个 `BEGIN IMMEDIATE` 事务内完成：并发回传按写锁串行化。
+  同一终点同一序号的并发同结果回传收敛为一条记录（所有调用方拿到同一份内容）；
+  并发不同结果时先提交者占定该序号，后到者得到 `attempt_result_conflict`；
+  较大序号先提交后，迟到的较小序号得到 `attempt_sequence_conflict` 且不写入。
+  查询在单只读快照内读取，尝试记录与汇总状态必然一致。
+- 第 N+1 次尝试本应只在第 N 次结果已知后发起，因此正常重试压力下每个序号的并发请求都是同一内容。
+- **回执不影响任何既有功能**：回执只写独立的 `delivery_attempts` 表，
+  `GET /deliveries/{id}` 的判定内容、`POST /deliveries` 的同编号原样重放、
+  `/deliveries/report` 报表（只统计判定）与灰度熔断的候选失败率统计（只数判定行）均完全不变。
+
 ## 项目结构
 
 ```
@@ -738,9 +854,9 @@ app/
   traffic.py   # 默认投递的稳定分桶：规范化地址 → 0–99 桶 → 基线/候选
   preview.py   # 发布前预览：草稿 vs 基线版本的投递差异对比（纯内存，不落库）
   reporting.py # 核对报表：带时区时间窗（左闭右开）校验、页大小校验、翻页游标编解码
-  models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标/按键合并操作组）
-  store.py     # 草稿、修订快照、发布版本、默认投递策略、幂等投递判定、核对报表与灰度熔断的持久化与查询
-  main.py      # FastAPI 路由（/draft、/draft/changes、/resolve、/preview、/policy、/policy/circuit-breaker、/deliver、/deliveries、/deliveries/batch、/deliveries/report 等）
-tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定 + 批量投递判定 + 按键合并与修订快照 + 核对报表 + 灰度自动熔断
+  models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标/按键合并操作组/投递回执）
+  store.py     # 草稿、修订快照、发布版本、默认投递策略、幂等投递判定、投递回执、核对报表与灰度熔断的持久化与查询
+  main.py      # FastAPI 路由（/draft、/draft/changes、/resolve、/preview、/policy、/policy/circuit-breaker、/deliver、/deliveries、/deliveries/batch、/deliveries/report、/deliveries/{id}/receipts 等）
+tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定 + 批量投递判定 + 投递回执 + 按键合并与修订快照 + 核对报表 + 灰度自动熔断
 Dockerfile / docker-compose.yml
 ```
